@@ -1,6 +1,17 @@
 import h5py, torch
 from torch.utils.data import DataLoader, TensorDataset
-from neural_net import FullyConnectedNetwork
+from neural_net import PCANet
+
+def ensure_mu_from_phi(model):
+    # Old checkpoints: mu buffers are empty; for non-centered PCA they should be zeros.
+    if getattr(model, "mu_a", None) is not None and model.mu_a.numel() == 0 and model.Phi_a.numel() > 0:
+        HW = model.Phi_a.shape[0]
+        model.mu_a = torch.zeros((HW,), dtype=model.Phi_a.dtype, device=model.Phi_a.device)
+
+    if getattr(model, "mu_u", None) is not None and model.mu_u.numel() == 0 and model.Phi_u.numel() > 0:
+        HW = model.Phi_u.shape[0]
+        model.mu_u = torch.zeros((HW,), dtype=model.Phi_u.dtype, device=model.Phi_u.device)
+
 
 def _realloc_register_buffers_from_state(model: torch.nn.Module, state: dict):
     """
@@ -43,25 +54,17 @@ def _realloc_register_buffers_from_state(model: torch.nn.Module, state: dict):
                 pass
             parent.register_buffer(buf_name, torch.empty_like(v, device="cpu"))
 
-def _ensure_4d(t):
-    if t.dim() == 3:
-        return t.unsqueeze(1)
-    if t.dim() == 4:
-        return t
-    raise ValueError(f"Expected 3D or 4D tensor, got {t.shape}")
-
 @torch.no_grad()
 def _per_sample_mse(u):
     """
     u: (B,1,H,W) or (B,H,W)
     returns: tensor of shape (B,) with MSE over all pixels per sample
     """
-    u = _ensure_4d(u)
     # mean over channel+spatial dims → (B,)
     return u.pow(2).mean(dim=(1,2,3))
 
 @torch.no_grad()
-def evaluate_relative_MSE_error(model, data_path, n_train, batch_size=64, device="cuda", last_N=300):
+def evaluate_relative_MSE_error(model, data_path, batch_size=64, device="cuda"):
     """
     Monte Carlo estimate of the expected relative error using MSE:
         mean_i sqrt( MSE(e_i) / MSE(u_i) )
@@ -70,15 +73,9 @@ def evaluate_relative_MSE_error(model, data_path, n_train, batch_size=64, device
     """
     # ---- load ----
     with h5py.File(data_path, "r") as f:
-        N = min(n_train, f["data/a"].shape[0], f["data/u"].shape[0])
-        X = torch.from_numpy(f["data/a"][:N]).float()
-        Y = torch.from_numpy(f["data/u"][:N]).float()
-
-    # ---- take last N samples as validation ----
-    val_N = N if last_N is None else max(1, min(int(last_N), N))
-    X_val = X[-val_N:]
-    Y_val = Y[-val_N:]
-
+        N = f["data/u"].shape[0]
+        X_val = torch.from_numpy(f["data/a"][:N]).float()
+        Y_val = torch.from_numpy(f["data/u"][:N]).float()
     # ---- loader ----
     val_ds = TensorDataset(X_val, Y_val)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
@@ -91,11 +88,7 @@ def evaluate_relative_MSE_error(model, data_path, n_train, batch_size=64, device
     for a_batch, u_true_batch in val_loader:
         a_batch = a_batch.to(device, non_blocking=True)
         u_true_batch = u_true_batch.to(device, non_blocking=True)
-
         u_pred_batch = model(a_batch)
-
-        u_true_batch = _ensure_4d(u_true_batch)
-        u_pred_batch = _ensure_4d(u_pred_batch)
 
         # ---- per-sample relative RMSE ----
         mse_num = _per_sample_mse(u_pred_batch - u_true_batch)   # (B,)
@@ -118,19 +111,17 @@ def evaluate_relative_MSE_error(model, data_path, n_train, batch_size=64, device
     return summary, rel_errors
 
 if __name__ == "__main__":
-        # Load model
-    path_ckpt = "pca_net_treshold_best.pt"
+    # Load model
+    path_ckpt = "pca_net_lognorm_best.pt"
     # Number of datapoints in training dataset
-    n_train = 4000
     n_basis = 70
-    path_data = "Datasets/threshold_dataset_256_4000.h5"
-    last_n_samples = 3000-24
-
+    path_data = "Datasets/lognormal_dataset_test_nodes257_2500.h5"
     # Load model from checkpoint
-    model = FullyConnectedNetwork(n_basis = 70)
+    model = PCANet(n_basis = n_basis, N=257)
     ckpt = torch.load(path_ckpt, map_location="cpu")
     state = ckpt["model_state"] if isinstance(ckpt,dict) and "model_state" in ckpt else ckpt
     _realloc_register_buffers_from_state(model,state)
     model.load_state_dict(state, strict=False)
-    summary, rel = evaluate_relative_MSE_error(model, path_data, n_train=n_train, last_N=last_n_samples)
+    ensure_mu_from_phi(model)
+    summary, rel = evaluate_relative_MSE_error(model, path_data)
     print(summary)
